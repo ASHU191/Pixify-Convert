@@ -4,10 +4,14 @@ import type React from "react"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { motion } from "framer-motion"
-import { Upload, Download, ImageIcon, CheckCircle2, Trash2 } from "lucide-react"
+import { Upload, Download, ImageIcon, CheckCircle2, Trash2, Settings } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Slider } from "@/components/ui/slider"
 
 type Item = {
   id: string
@@ -16,6 +20,8 @@ type Item = {
   size: number
   previewUrl: string
   webpUrl?: string
+  webpSize?: number
+  usedQualityPct?: number
   status: "idle" | "converting" | "done" | "error"
   error?: string
 }
@@ -24,6 +30,11 @@ export function Converter() {
   const inputRef = useRef<HTMLInputElement | null>(null)
   const [items, setItems] = useState<Item[]>([])
   const [isDragging, setIsDragging] = useState(false)
+  const [quality, setQuality] = useState<number>(0.9)
+  const [selectedFormat, setSelectedFormat] = useState<string>("webp")
+  const [mode, setMode] = useState<"auto" | "quality" | "size">("auto")
+  const [qualityPct, setQualityPct] = useState<number>(90) // 0-100
+  const [maxSizeKB, setMaxSizeKB] = useState<number>(300)
 
   const totalConverted = useMemo(() => items.filter((i) => i.status === "done").length, [items])
 
@@ -57,29 +68,91 @@ export function Converter() {
     [onFiles],
   )
 
-  const convertOne = useCallback(async (item: Item, quality = 0.9) => {
-    try {
-      setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, status: "converting", error: undefined } : p)))
-      const img = await loadImage(item.previewUrl)
-      const canvas = document.createElement("canvas")
-      const ctx = canvas.getContext("2d")
-      if (!ctx) throw new Error("Unable to get canvas context")
+  const toWebpBlob = useCallback(
+    (canvas: HTMLCanvasElement, q: number) =>
+      new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/webp", q)),
+    [],
+  )
 
-      canvas.width = img.naturalWidth
-      canvas.height = img.naturalHeight
-      ctx.drawImage(img, 0, 0)
+  const convertOne = useCallback(
+    async (item: Item) => {
+      try {
+        setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, status: "converting", error: undefined } : p)))
+        const img = await loadImage(item.previewUrl)
+        const canvas = document.createElement("canvas")
+        const ctx = canvas.getContext("2d")
+        if (!ctx) throw new Error("Unable to get canvas context")
+        canvas.width = img.naturalWidth
+        canvas.height = img.naturalHeight
+        ctx.drawImage(img, 0, 0)
 
-      const blob: Blob | null = await new Promise((resolve) => canvas.toBlob((b) => resolve(b), "image/webp", quality))
-      if (!blob) throw new Error("Failed to convert to WEBP")
+        let chosenQ = 0.9
+        let blob: Blob | null = null
 
-      const webpUrl = URL.createObjectURL(blob)
-      setItems((prev) => prev.map((p) => (p.id === item.id ? { ...p, webpUrl, status: "done" } : p)))
-    } catch (err: any) {
-      setItems((prev) =>
-        prev.map((p) => (p.id === item.id ? { ...p, status: "error", error: err?.message || "Error" } : p)),
-      )
-    }
-  }, [])
+        if (mode === "auto") {
+          chosenQ = 0.9
+          blob = await toWebpBlob(canvas, chosenQ)
+        } else if (mode === "quality") {
+          chosenQ = Math.min(Math.max(qualityPct / 100, 0.01), 1)
+          blob = await toWebpBlob(canvas, chosenQ)
+        } else {
+          // mode === "size" -> binary search quality for target size
+          const target = Math.max(1, maxSizeKB) // KB
+          let low = 0.1
+          let high = 0.95
+          let best: { blob: Blob; q: number } | null = null
+
+          for (let i = 0; i < 9; i++) {
+            const mid = (low + high) / 2
+            const test = await toWebpBlob(canvas, mid)
+            if (!test) break
+            const kb = test.size / 1024
+            if (kb <= target) {
+              best = { blob: test, q: mid }
+              // try higher quality while staying under target
+              low = mid + 0.02
+              if (low > 0.98) break
+            } else {
+              high = mid - 0.02
+              if (high < 0.05) break
+            }
+          }
+
+          if (best) {
+            blob = best.blob
+            chosenQ = best.q
+          } else {
+            // fallback: try a conservative low quality
+            chosenQ = 0.5
+            blob = await toWebpBlob(canvas, chosenQ)
+          }
+        }
+
+        if (!blob) throw new Error("Failed to convert to WEBP")
+
+        const nextUrl = URL.createObjectURL(blob)
+        // revoke any previous url to avoid leaks
+        setItems((prev) =>
+          prev.map((p) => {
+            if (p.id !== item.id) return p
+            if (p.webpUrl && p.webpUrl !== nextUrl) URL.revokeObjectURL(p.webpUrl)
+            return {
+              ...p,
+              webpUrl: nextUrl,
+              webpSize: blob!.size,
+              usedQualityPct: Math.round(chosenQ * 100),
+              status: "done",
+            }
+          }),
+        )
+      } catch (err: any) {
+        setItems((prev) =>
+          prev.map((p) => (p.id === item.id ? { ...p, status: "error", error: err?.message || "Error" } : p)),
+        )
+      }
+    },
+    [mode, qualityPct, maxSizeKB, toWebpBlob],
+  )
 
   const convertAll = useCallback(async () => {
     for (const it of items) {
@@ -147,6 +220,71 @@ export function Converter() {
             Choose PNGs
           </button>
         </label>
+
+        {/* Compression Settings Toolbar */}
+        <Card className="border border-border/60 bg-card/70 p-4 backdrop-blur">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="inline-flex items-center gap-2">
+              <Settings className="h-4 w-4 text-muted-foreground" aria-hidden />
+              <span className="text-sm font-medium">Compression Settings</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Label htmlFor="mode" className="text-xs text-muted-foreground">
+                Mode
+              </Label>
+              <Select value={mode} onValueChange={(v) => setMode(v as typeof mode)}>
+                <SelectTrigger id="mode" className="h-8">
+                  <SelectValue placeholder="Select mode" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="quality">By Quality</SelectItem>
+                  <SelectItem value="size">By Max Size</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {mode === "quality" && (
+              <div className="flex flex-1 items-center gap-3">
+                <Label className="text-xs text-muted-foreground">Quality</Label>
+                <div className="min-w-[160px] flex-1">
+                  <Slider value={[qualityPct]} min={1} max={100} onValueChange={(v) => setQualityPct(v[0] ?? 90)} />
+                </div>
+                <div className="flex items-center gap-1">
+                  {[40, 60, 80, 90].map((q) => (
+                    <Button key={q} size="sm" variant="outline" onClick={() => setQualityPct(q)}>
+                      {q}%
+                    </Button>
+                  ))}
+                </div>
+                <div className="text-xs tabular-nums text-muted-foreground">{qualityPct}%</div>
+              </div>
+            )}
+
+            {mode === "size" && (
+              <div className="flex items-center gap-2">
+                <Label htmlFor="maxkb" className="text-xs text-muted-foreground">
+                  Max Size
+                </Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="maxkb"
+                    className="h-8 w-28"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={maxSizeKB}
+                    onChange={(e) => {
+                      const n = Number.parseInt(e.target.value.replace(/[^0-9]/g, "") || "0", 10)
+                      setMaxSizeKB(Number.isFinite(n) ? n : 300)
+                    }}
+                  />
+                  <span className="text-xs text-muted-foreground">KB</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
 
         {items.length > 0 && (
           <div className="flex items-center justify-between">
@@ -236,6 +374,14 @@ export function Converter() {
                     </motion.div>
                   )}
                 </div>
+
+                {/* Show result info: size + used quality */}
+                {item.status === "done" && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    WEBP size: {((item.webpSize || 0) / 1024).toFixed(1)} KB
+                    {typeof item.usedQualityPct === "number" ? ` • Quality: ${item.usedQualityPct}%` : null}
+                  </p>
+                )}
 
                 {item.error && <p className="mt-2 text-sm text-destructive">{item.error}</p>}
               </Card>
