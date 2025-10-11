@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
+import { Switch } from "@/components/ui/switch"
 
 type Item = {
   id: string
@@ -22,6 +23,7 @@ type Item = {
   webpUrl?: string
   webpSize?: number
   usedQualityPct?: number
+  usedScalePct?: number
   status: "idle" | "converting" | "done" | "error"
   error?: string
 }
@@ -32,9 +34,10 @@ export function Converter() {
   const [isDragging, setIsDragging] = useState(false)
   const [quality, setQuality] = useState<number>(0.9)
   const [selectedFormat, setSelectedFormat] = useState<string>("webp")
-  const [mode, setMode] = useState<"auto" | "quality" | "size">("auto")
+  const [mode, setMode] = useState<"auto" | "quality" | "size" | "both">("auto")
   const [qualityPct, setQualityPct] = useState<number>(90) // 0-100
   const [maxSizeKB, setMaxSizeKB] = useState<number>(300)
+  const [allowUpscale, setAllowUpscale] = useState<boolean>(true)
 
   const totalConverted = useMemo(() => items.filter((i) => i.status === "done").length, [items])
 
@@ -68,11 +71,236 @@ export function Converter() {
     [onFiles],
   )
 
-  const toWebpBlob = useCallback(
+  const webpAtQuality = useCallback(
     (canvas: HTMLCanvasElement, q: number) =>
       new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/webp", q)),
     [],
   )
+
+  // Binary search quality for a target size on a given canvas
+  const findQualityForTargetKB = useCallback(
+    async (
+      canvas: HTMLCanvasElement,
+      targetKB: number,
+      minQ = 0.01,
+      maxQ = 0.999,
+      iterations = 12,
+    ): Promise<{ blob: Blob; q: number } | null> => {
+      let low = minQ
+      let high = maxQ
+      let best: { blob: Blob; q: number } | null = null
+
+      for (let i = 0; i < iterations; i++) {
+        const mid = (low + high) / 2
+        const blob = await webpAtQuality(canvas, mid)
+        if (!blob) break
+        const kb = blob.size / 1024
+
+        if (kb <= targetKB) {
+          best = { blob, q: mid }
+          // try higher quality while staying under target
+          low = Math.min(0.999, mid + 0.02)
+        } else {
+          high = Math.max(minQ, mid - 0.02)
+        }
+
+        if (Math.abs(low - high) < 0.005) break
+      }
+      return best
+    },
+    [webpAtQuality],
+  )
+
+  // Helper to upscale while keeping a fixed quality and staying under a target size (maximize scale under cap)
+  const upscaleToTargetWithFixedQuality = useCallback(
+    async (
+      srcCanvas: HTMLCanvasElement,
+      targetKB: number,
+      fixedQ01: number,
+      maxScale = 2.5,
+    ): Promise<{ blob: Blob; q: number; scale: number } | null> => {
+      const tolKB = 2
+      let low = 1
+      let high = maxScale
+      let best: { blob: Blob; q: number; scale: number } | null = null
+
+      for (let i = 0; i < 10; i++) {
+        const mid = (low + high) / 2
+        const w = Math.max(1, Math.floor(srcCanvas.width * mid))
+        const h = Math.max(1, Math.floor(srcCanvas.height * mid))
+        const scaled = document.createElement("canvas")
+        scaled.width = w
+        scaled.height = h
+        const sctx = scaled.getContext("2d")
+        if (!sctx) break
+        sctx.imageSmoothingEnabled = true
+        sctx.imageSmoothingQuality = "high"
+        sctx.drawImage(srcCanvas, 0, 0, w, h)
+
+        const blob = await webpAtQuality(scaled, fixedQ01)
+        if (!blob) break
+        const kb = blob.size / 1024
+
+        if (kb <= targetKB) {
+          best = { blob, q: fixedQ01, scale: mid }
+          if (Math.abs(targetKB - kb) <= tolKB) break // close enough
+          low = Math.min(maxScale, mid + 0.05)
+        } else {
+          high = Math.max(1, mid - 0.05)
+        }
+        if (high - low < 0.02) break
+      }
+      return best
+    },
+    [webpAtQuality],
+  )
+
+  // Try to hit target size: first with quality, then progressively downscale if needed
+  const convertToTargetSize = useCallback(
+    async (
+      srcCanvas: HTMLCanvasElement,
+      targetKB: number,
+      allowUp: boolean,
+    ): Promise<{ blob: Blob; q: number; scale: number }> => {
+      const tolKB = 2
+      const direct = await findQualityForTargetKB(srcCanvas, targetKB)
+      if (direct) {
+        const underBy = targetKB - direct.blob.size / 1024
+        if (allowUp && underBy > tolKB && direct.q >= 0.95) {
+          const up = await upscaleToTargetWithFixedQuality(
+            srcCanvas,
+            targetKB,
+            Math.min(0.999, Math.max(0.95, direct.q)),
+          )
+          if (up) return up
+        }
+        return { blob: direct.blob, q: direct.q, scale: 1 }
+      }
+
+      // 2) Downscale loop if quality-only can't meet target
+      let bestOverall: { blob: Blob; q: number; scale: number } | null = null
+      const scales = [
+        0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.12, 0.1,
+      ]
+      for (const s of scales) {
+        const scaled = document.createElement("canvas")
+        const sw = Math.max(1, Math.floor(srcCanvas.width * s))
+        const sh = Math.max(1, Math.floor(srcCanvas.height * s))
+        scaled.width = sw
+        scaled.height = sh
+        const sctx = scaled.getContext("2d")
+        if (!sctx) continue
+        sctx.drawImage(srcCanvas, 0, 0, sw, sh)
+
+        // try to meet the cap at this scale using highest possible quality
+        const attempt = await findQualityForTargetKB(scaled, targetKB)
+        if (attempt) return { blob: attempt.blob, q: attempt.q, scale: s }
+
+        // track the smallest we can achieve as a graceful fallback
+        const fallbackQ = 0.35
+        const fbBlob = await webpAtQuality(scaled, fallbackQ)
+        if (fbBlob) {
+          if (!bestOverall || fbBlob.size < bestOverall.blob.size) {
+            bestOverall = { blob: fbBlob, q: fallbackQ, scale: s }
+          }
+        }
+      }
+
+      if (bestOverall) return bestOverall
+
+      // 3) Last resort: original canvas at a modest quality
+      const last = await webpAtQuality(srcCanvas, 0.35)
+      if (!last) throw new Error("Failed to create WEBP")
+      return { blob: last, q: 0.35, scale: 1 }
+    },
+    [findQualityForTargetKB, upscaleToTargetWithFixedQuality, webpAtQuality],
+  )
+
+  // Helper: fit to size while keeping a fixed quality (scale only, binary search on scale)
+  const fitToSizeWithFixedQuality = useCallback(
+    async (
+      srcCanvas: HTMLCanvasElement,
+      targetKB: number,
+      fixedQ01: number,
+      allowUp: boolean,
+    ): Promise<{ blob: Blob; q: number; scale: number }> => {
+      const first = await webpAtQuality(srcCanvas, fixedQ01)
+      if (!first) throw new Error("Failed to create WEBP")
+
+      if (first.size / 1024 <= targetKB) {
+        if (allowUp) {
+          const up = await upscaleToTargetWithFixedQuality(srcCanvas, targetKB, fixedQ01)
+          if (up) return up
+        }
+        return { blob: first, q: fixedQ01, scale: 1 }
+      }
+
+      // Binary search scale between [minScale, 1] to meet target size using fixed quality
+      let low = 0.1
+      let high = 1
+      let best: { blob: Blob; q: number; scale: number } | null = null
+      for (let i = 0; i < 8; i++) {
+        const mid = (low + high) / 2
+        const w = Math.max(1, Math.floor(srcCanvas.width * mid))
+        const h = Math.max(1, Math.floor(srcCanvas.height * mid))
+        const scaled = document.createElement("canvas")
+        scaled.width = w
+        scaled.height = h
+        const sctx = scaled.getContext("2d")
+        if (!sctx) break
+        sctx.drawImage(srcCanvas, 0, 0, w, h)
+        const blob = await webpAtQuality(scaled, fixedQ01)
+        if (!blob) break
+        const kb = blob.size / 1024
+        if (kb <= targetKB) {
+          best = { blob, q: fixedQ01, scale: mid }
+          // try larger (higher) scale while staying under cap
+          low = Math.min(0.999, mid + 0.05)
+        } else {
+          // need to scale down further
+          high = Math.max(0.1, mid - 0.05)
+        }
+        if (Math.abs(high - low) < 0.02) break
+      }
+
+      if (best) return best
+
+      // Fallback: smallest we can produce with this fixed quality using a coarse scale sweep
+      let fallback: { blob: Blob; q: number; scale: number } | null = null
+      for (const s of [0.25, 0.2, 0.15, 0.12, 0.1]) {
+        const w = Math.max(1, Math.floor(srcCanvas.width * s))
+        const h = Math.max(1, Math.floor(srcCanvas.height * s))
+        const scaled = document.createElement("canvas")
+        scaled.width = w
+        scaled.height = h
+        const sctx = scaled.getContext("2d")
+        if (!sctx) continue
+        sctx.drawImage(srcCanvas, 0, 0, w, h)
+        const blob = await webpAtQuality(scaled, fixedQ01)
+        if (blob && (!fallback || blob.size < fallback.blob.size)) {
+          fallback = { blob, q: fixedQ01, scale: s }
+        }
+      }
+      if (fallback) return fallback
+
+      // Last resort: return the original attempt (will exceed target)
+      return { blob: first, q: fixedQ01, scale: 1 }
+    },
+    [webpAtQuality, upscaleToTargetWithFixedQuality],
+  )
+
+  const clearAll = useCallback(() => {
+    setItems((prev) => {
+      prev.forEach((i) => {
+        URL.revokeObjectURL(i.previewUrl)
+        if (i.webpUrl) URL.revokeObjectURL(i.webpUrl)
+      })
+      return []
+    })
+    if (inputRef.current) {
+      inputRef.current.value = ""
+    }
+  }, [setItems])
 
   const convertOne = useCallback(
     async (item: Item) => {
@@ -87,51 +315,33 @@ export function Converter() {
         ctx.drawImage(img, 0, 0)
 
         let chosenQ = 0.9
+        let chosenScale = 1
         let blob: Blob | null = null
 
         if (mode === "auto") {
           chosenQ = 0.9
-          blob = await toWebpBlob(canvas, chosenQ)
+          blob = await webpAtQuality(canvas, chosenQ)
         } else if (mode === "quality") {
           chosenQ = Math.min(Math.max(qualityPct / 100, 0.01), 1)
-          blob = await toWebpBlob(canvas, chosenQ)
+          blob = await webpAtQuality(canvas, chosenQ)
+        } else if (mode === "both") {
+          const target = Math.max(1, maxSizeKB)
+          chosenQ = Math.min(Math.max(qualityPct / 100, 0.01), 1)
+          const res = await fitToSizeWithFixedQuality(canvas, target, chosenQ, allowUpscale)
+          blob = res.blob
+          chosenScale = res.scale
         } else {
-          // mode === "size" -> binary search quality for target size
-          const target = Math.max(1, maxSizeKB) // KB
-          let low = 0.1
-          let high = 0.95
-          let best: { blob: Blob; q: number } | null = null
-
-          for (let i = 0; i < 9; i++) {
-            const mid = (low + high) / 2
-            const test = await toWebpBlob(canvas, mid)
-            if (!test) break
-            const kb = test.size / 1024
-            if (kb <= target) {
-              best = { blob: test, q: mid }
-              // try higher quality while staying under target
-              low = mid + 0.02
-              if (low > 0.98) break
-            } else {
-              high = mid - 0.02
-              if (high < 0.05) break
-            }
-          }
-
-          if (best) {
-            blob = best.blob
-            chosenQ = best.q
-          } else {
-            // fallback: try a conservative low quality
-            chosenQ = 0.5
-            blob = await toWebpBlob(canvas, chosenQ)
-          }
+          // mode === "size"
+          const target = Math.max(1, maxSizeKB)
+          const res = await convertToTargetSize(canvas, target, allowUpscale)
+          blob = res.blob
+          chosenQ = res.q
+          chosenScale = res.scale
         }
 
         if (!blob) throw new Error("Failed to convert to WEBP")
 
         const nextUrl = URL.createObjectURL(blob)
-        // revoke any previous url to avoid leaks
         setItems((prev) =>
           prev.map((p) => {
             if (p.id !== item.id) return p
@@ -141,6 +351,7 @@ export function Converter() {
               webpUrl: nextUrl,
               webpSize: blob!.size,
               usedQualityPct: Math.round(chosenQ * 100),
+              usedScalePct: Math.round(chosenScale * 100),
               status: "done",
             }
           }),
@@ -151,7 +362,7 @@ export function Converter() {
         )
       }
     },
-    [mode, qualityPct, maxSizeKB, toWebpBlob],
+    [mode, qualityPct, maxSizeKB, allowUpscale, webpAtQuality, convertToTargetSize, fitToSizeWithFixedQuality],
   )
 
   const convertAll = useCallback(async () => {
@@ -213,7 +424,10 @@ export function Converter() {
           <p className="mt-1 text-sm text-muted-foreground">{"or click to browse"}</p>
           <button
             type="button"
-            onClick={() => inputRef.current?.click()}
+            onClick={() => {
+              if (inputRef.current) inputRef.current.value = ""
+              inputRef.current?.click()
+            }}
             className="mt-4 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2 text-sm text-primary-foreground shadow ring-1 ring-primary/20 transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ImageIcon className="h-4 w-4" aria-hidden />
@@ -241,6 +455,7 @@ export function Converter() {
                   <SelectItem value="auto">Auto</SelectItem>
                   <SelectItem value="quality">By Quality</SelectItem>
                   <SelectItem value="size">By Max Size</SelectItem>
+                  <SelectItem value="both">Quality + Max Size</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -263,11 +478,11 @@ export function Converter() {
             )}
 
             {mode === "size" && (
-              <div className="flex items-center gap-2">
-                <Label htmlFor="maxkb" className="text-xs text-muted-foreground">
-                  Max Size
-                </Label>
+              <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">
+                  <Label htmlFor="maxkb" className="text-xs text-muted-foreground">
+                    Max Size
+                  </Label>
                   <Input
                     id="maxkb"
                     className="h-8 w-28"
@@ -281,6 +496,61 @@ export function Converter() {
                   />
                   <span className="text-xs text-muted-foreground">KB</span>
                 </div>
+                <div className="flex items-center gap-2">
+                  <Switch id="upscale-size" checked={allowUpscale} onCheckedChange={setAllowUpscale} />
+                  <Label htmlFor="upscale-size" className="text-xs text-muted-foreground">
+                    Aim near cap (can upscale)
+                  </Label>
+                </div>
+              </div>
+            )}
+
+            {mode === "both" && (
+              <div className="flex flex-1 flex-wrap items-center gap-4">
+                <div className="flex items-center gap-3">
+                  <Label className="text-xs text-muted-foreground">Quality</Label>
+                  <div className="min-w-[160px]">
+                    <Slider value={[qualityPct]} min={1} max={100} onValueChange={(v) => setQualityPct(v[0] ?? 90)} />
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {[40, 60, 80, 90].map((q) => (
+                      <Button key={q} size="sm" variant="outline" onClick={() => setQualityPct(q)}>
+                        {q}%
+                      </Button>
+                    ))}
+                  </div>
+                  <div className="text-xs tabular-nums text-muted-foreground">{qualityPct}%</div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="maxkb-both" className="text-xs text-muted-foreground">
+                    Max Size
+                  </Label>
+                  <Input
+                    id="maxkb-both"
+                    className="h-8 w-28"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={maxSizeKB}
+                    onChange={(e) => {
+                      const n = Number.parseInt(e.target.value.replace(/[^0-9]/g, "") || "0", 10)
+                      setMaxSizeKB(Number.isFinite(n) ? n : 300)
+                    }}
+                  />
+                  <span className="text-xs text-muted-foreground">KB</span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Switch id="upscale-both" checked={allowUpscale} onCheckedChange={setAllowUpscale} />
+                  <Label htmlFor="upscale-both" className="text-xs text-muted-foreground">
+                    Aim near cap (can upscale)
+                  </Label>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Keeps your selected quality and resizes to stay under the max size. With “Aim near cap” enabled, it
+                  can upscale to approach the target when the file would otherwise be much smaller.
+                </p>
               </div>
             )}
           </div>
@@ -295,7 +565,7 @@ export function Converter() {
               <Button variant="secondary" onClick={convertAll}>
                 Convert All
               </Button>
-              <Button variant="outline" onClick={() => setItems([])}>
+              <Button variant="outline" onClick={clearAll}>
                 Clear All
               </Button>
             </div>
@@ -375,11 +645,17 @@ export function Converter() {
                   )}
                 </div>
 
-                {/* Show result info: size + used quality */}
+                {/* Show result info: size + used quality (+ scale if applied) */}
                 {item.status === "done" && (
                   <p className="mt-2 text-xs text-muted-foreground">
                     WEBP size: {((item.webpSize || 0) / 1024).toFixed(1)} KB
                     {typeof item.usedQualityPct === "number" ? ` • Quality: ${item.usedQualityPct}%` : null}
+                    {typeof item.usedScalePct === "number" && item.usedScalePct !== 100
+                      ? ` • Scale: ${item.usedScalePct}%`
+                      : null}
+                    {(mode === "size" || mode === "both") && item.webpSize && item.webpSize / 1024 > maxSizeKB
+                      ? " • Note: could not reach target size; returned smallest possible."
+                      : null}
                   </p>
                 )}
 
