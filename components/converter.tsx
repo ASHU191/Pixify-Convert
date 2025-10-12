@@ -37,7 +37,7 @@ export function Converter() {
   const [mode, setMode] = useState<"auto" | "quality" | "size" | "both">("auto")
   const [qualityPct, setQualityPct] = useState<number>(90) // 0-100
   const [maxSizeKB, setMaxSizeKB] = useState<number>(300)
-  const [allowUpscale, setAllowUpscale] = useState<boolean>(true)
+  const [allowUpscale, setAllowUpscale] = useState<boolean>(true) // default 'Aim near cap' ON
 
   const totalConverted = useMemo(() => items.filter((i) => i.status === "done").length, [items])
 
@@ -117,14 +117,15 @@ export function Converter() {
       srcCanvas: HTMLCanvasElement,
       targetKB: number,
       fixedQ01: number,
-      maxScale = 2.5,
+      maxScale = 6, // was 2.5; increase so we can approach the cap when enabled
     ): Promise<{ blob: Blob; q: number; scale: number } | null> => {
       const tolKB = 2
       let low = 1
       let high = maxScale
       let best: { blob: Blob; q: number; scale: number } | null = null
 
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 12; i++) {
+        // a few more iterations for precision
         const mid = (low + high) / 2
         const w = Math.max(1, Math.floor(srcCanvas.width * mid))
         const h = Math.max(1, Math.floor(srcCanvas.height * mid))
@@ -143,7 +144,7 @@ export function Converter() {
 
         if (kb <= targetKB) {
           best = { blob, q: fixedQ01, scale: mid }
-          if (Math.abs(targetKB - kb) <= tolKB) break // close enough
+          if (Math.abs(targetKB - kb) <= tolKB) break
           low = Math.min(maxScale, mid + 0.05)
         } else {
           high = Math.max(1, mid - 0.05)
@@ -327,7 +328,7 @@ export function Converter() {
         } else if (mode === "both") {
           const target = Math.max(1, maxSizeKB)
           chosenQ = Math.min(Math.max(qualityPct / 100, 0.01), 1)
-          const res = await fitToSizeWithFixedQuality(canvas, target, chosenQ, allowUpscale)
+          const res = await fitToSizeWithFixedQuality(canvas, target, chosenQ, true /* force upscale to approach cap */)
           blob = res.blob
           chosenScale = res.scale
         } else {
@@ -548,8 +549,8 @@ export function Converter() {
                 </div>
 
                 <p className="text-xs text-muted-foreground">
-                  Keeps your selected quality and resizes to stay under the max size. With “Aim near cap” enabled, it
-                  can upscale to approach the target when the file would otherwise be much smaller.
+                  Keeps your selected quality and automatically resizes to stay close to the max size (never exceeding
+                  it).
                 </p>
               </div>
             )}
