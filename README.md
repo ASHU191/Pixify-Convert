@@ -12,7 +12,7 @@ No uploads, no servers, no limits. 100% private, smooth, and blazing fast.
 - **Next.js 15 (App Router)**
 - **TypeScript**
 - **Tailwind CSS**
-- **Framer Motion**
+- **Framer Motion** 
 - **shadcn/ui**
 - **lucide-react**
 
