@@ -16,7 +16,7 @@ No uploads, no servers, no limits. 100% private, smooth, and blazing fast.
 - **shadcn/ui**
 - **lucide-react**
 
-It allows users to **upload or drag & drop PNG files**, instantly **convert them to WEBP**, and **download them** — all handled securely within the browser using the **Canvas API**.  
+It allows users to **upload or drag & drop PNG files**, instantly **convert them to WEBP**, and **download them** — all handled securely within the browser using the **Canvas API**.     
 No backend or database required — everything runs locally for top performance and complete privacy.
 
 ---
