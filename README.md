@@ -25,7 +25,7 @@ No backend or database required — everything runs locally for top performance 
 
 - ⚡ **Instant Conversion** – Convert PNG → WEBP in seconds  
 - 💾 **100% Private** – Everything runs locally, no uploads or API calls  
-- 🎨 **High Quality WEBP Output** – Adjustable compression with perfect visual quality  
+- 🎨 **High Quality WEBP Output** – Adjustable compression with perfect visual quality    
 - 📱 **Fully Responsive** – Works beautifully on desktop and mobile  
 - 🌈 **Modern UI/UX** – Gradient backgrounds, glassmorphism, and smooth animations  
 - 🌙 **Light / Dark Mode** – Switch themes instantly  
